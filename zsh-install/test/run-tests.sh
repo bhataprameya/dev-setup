@@ -192,7 +192,8 @@ fi
 # --- 5. chsh failure -> bash handoff --------------------------------------- #
 t="when chsh fails, a bash -> zsh handoff is installed"
 H3="$(mktmpd)"; STUB="$(stub_dir chsh sudo)"
-if env HOME="$H3" PATH="$STUB:$PATH" NO_CHSH=0 NO_FONT=1 NO_EXEC=1 NO_ZSH_INSTALL=1 \
+if env HOME="$H3" PATH="$STUB:$PATH" TEST_RECORDED_SHELL=/bin/bash \
+     NO_CHSH=0 NO_FONT=1 NO_EXEC=1 NO_ZSH_INSTALL=1 \
      sh "$INSTALL" >"$H3/.install.log" 2>&1; then
   if grep -q '# >>> zsh-install: launch zsh >>>' "$H3/.bashrc" 2>/dev/null; then tpass "$t"
   else tfail "$t" "handoff block not added to .bashrc"; fi
@@ -212,7 +213,7 @@ out="$(env HOME="$H3" ZSH_INSTALL_NO_HANDOFF=1 timeout 10 bash -ic 'echo SURVIVE
 case "$out" in *SURVIVED*) tpass "$t" ;; *) tfail "$t" "opt-out ignored (got: $out)" ;; esac
 
 t="handoff is not duplicated on repeated installs"
-env HOME="$H3" PATH="$STUB:$PATH" NO_CHSH=0 NO_FONT=1 NO_EXEC=1 NO_ZSH_INSTALL=1 sh "$INSTALL" >/dev/null 2>&1 || true
+env HOME="$H3" PATH="$STUB:$PATH" TEST_RECORDED_SHELL=/bin/bash NO_CHSH=0 NO_FONT=1 NO_EXEC=1 NO_ZSH_INSTALL=1 sh "$INSTALL" >/dev/null 2>&1 || true
 n="$(grep -c '# >>> zsh-install: launch zsh >>>' "$H3/.bashrc" 2>/dev/null || echo 0)"
 [ "$n" = "1" ] && tpass "$t" || tfail "$t" "expected 1 handoff block, found $n"
 rm -rf "$STUB"
@@ -262,6 +263,52 @@ if env HOME="$H6" NO_CHSH=1 NO_FONT=1 NO_EXEC=1 NO_ZSH_INSTALL=1 ASSET_BASE="htt
   [ -s "$H6/.p10k.zsh" ] && tpass "$t" || tfail "$t" ".p10k.zsh not installed from clone"
 else
   tfail "$t" "clone-mode install failed"
+fi
+
+# --- 9. broken zsh detection ------------------------------------------------ #
+t="a broken zsh on PATH is ignored; a working system zsh is used"
+H7="$(mktmpd)"; STUB="$(stub_dir zsh)"
+if env HOME="$H7" PATH="$STUB:$PATH" NO_CHSH=1 NO_FONT=1 NO_EXEC=1 NO_ZSH_INSTALL=1 \
+     sh "$INSTALL" >"$H7/.install.log" 2>&1; then
+  if grep -q 'zsh: /usr/bin/zsh' "$H7/.install.log"; then tpass "$t"
+  else tfail "$t" "installer adopted a broken zsh (see $H7/.install.log)"; fi
+else
+  tfail "$t" "installer failed when a broken zsh shadowed PATH"
+fi
+rm -rf "$STUB"
+
+t="only a broken zsh exists: installer refuses and explains (NO_ZSH_INSTALL=1)"
+H8="$(mktmpd)"; STUB="$(stub_dir zsh)"
+if env HOME="$H8" PATH="$STUB:$PATH" ZSH_CANDIDATES="/nonexistent/bin/zsh" \
+     NO_CHSH=1 NO_FONT=1 NO_EXEC=1 NO_ZSH_INSTALL=1 \
+     sh "$INSTALL" >"$H8/.install.log" 2>&1; then
+  tfail "$t" "installer proceeded with a broken zsh"
+else
+  if grep -q 'no working zsh found' "$H8/.install.log"; then tpass "$t"
+  else tfail "$t" "did not die with a clear message (see $H8/.install.log)"; fi
+fi
+rm -rf "$STUB"
+
+t="a working zsh outside standard paths is adopted from PATH"
+H9="$(mktmpd)"; D="$(mktmpd)"
+printf '#!/bin/sh\nexec /usr/bin/zsh "$@"\n' > "$D/zsh"; chmod +x "$D/zsh"
+if env HOME="$H9" PATH="$D:$PATH" ZSH_CANDIDATES="/nonexistent/bin/zsh" \
+     NO_CHSH=1 NO_FONT=1 NO_EXEC=1 NO_ZSH_INSTALL=1 \
+     sh "$INSTALL" >"$H9/.install.log" 2>&1; then
+  if grep -qF "zsh: $D/zsh" "$H9/.install.log"; then tpass "$t"
+  else tfail "$t" "PATH-only working zsh not adopted (see $H9/.install.log)"; fi
+else
+  tfail "$t" "install failed when zsh lives only on PATH"
+fi
+rm -rf "$D"
+
+t="generated .zshrc includes user-local module discovery"
+H10="$(mktmpd)"
+if run_install "$H10"; then
+  if grep -qF 'module_path=("$_moddir" $module_path)' "$H10/.zshrc"; then tpass "$t"
+  else tfail "$t" "module discovery block missing from .zshrc"; fi
+else
+  tfail "$t" "install failed (see $H10/.install.log)"
 fi
 
 # =========================================================================== #
