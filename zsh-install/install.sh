@@ -10,6 +10,11 @@
 # POSIX shell (sh/dash/ash/bash/zsh).
 # Idempotent: safe to re-run. Existing configs are backed up, then cleanly replaced/updated.
 #
+# zsh handling: the installer health-checks zsh (its core modules must load) and
+# prefers the system zsh over a broken user-local shadow build (e.g. a source
+# build in ~/.local/bin). If no working zsh exists it installs the distro one,
+# which also provides the missing core module .so files.
+#
 # Optional env overrides (mostly for testing/mirrors):
 #   NO_CHSH=1        don't change the login shell
 #   NO_FONT=1        don't install the MesloLGS NF font
@@ -18,6 +23,8 @@
 #   NO_BASH_HANDOFF=1 don't add the bash -> zsh handoff fallback
 #   ALL_USERS=1      also set up every real user + root (needs root/sudo)
 #   ASSET_BASE=...   where to fetch .p10k.zsh from (http(s) URL or local dir)
+#   ZSH_CANDIDATES=... space-separated system zsh paths to try before PATH lookup
+#   TEST_RECORDED_SHELL=... fake the user's recorded login shell (tests)
 #   *_REPO=...       override any source git repo (local path or URL)
 
 set -eu
@@ -35,6 +42,9 @@ set -eu
 : "${NO_CHSH:=0}"
 : "${NO_FONT:=0}"
 : "${NO_ZSH_INSTALL:=0}"
+# Space-separated system zsh paths, tried before PATH lookup. Override for
+# distros that install elsewhere (NixOS, custom prefixes, ...).
+: "${ZSH_CANDIDATES:=/usr/bin/zsh /bin/zsh /usr/local/bin/zsh /opt/homebrew/bin/zsh /opt/local/bin/zsh}"
 
 ZSH_DIR="$HOME/.oh-my-zsh"
 ZSH_CUSTOM_DIR="$ZSH_DIR/custom"
@@ -127,19 +137,55 @@ log "Detected OS: $OS"
 
 have git || { log "Installing git"; install_pkg git || die "git is required but not installed"; }
 
-if ! have zsh; then
-  if [ "$NO_ZSH_INSTALL" = "1" ]; then
-    die "zsh is not installed (NO_ZSH_INSTALL=1 set)"
+# A zsh binary can exist but be useless: if it was built for a module path that
+# doesn't exist on this machine, core modules (zsh/zle, zsh/parameter, ...) fail
+# with "cannot open shared object file: zsh/zle.so". Verify before trusting any
+# zsh, and prefer the system one over a possibly-broken user-local shadow build
+# (common source-build location: ~/.local/bin/zsh on top of PATH).
+zsh_usable() {
+  _z="$1"
+  "$_z" -f -c '
+    for d in ${HOME}/.local/lib/*/zsh/*(N) ${HOME}/.local/lib/zsh/*(N); do
+      [ -d "$d/zsh" ] && module_path=("$d" $module_path)
+    done
+    zmodload zsh/zle 2>/dev/null || exit 1
+    zmodload zsh/parameter 2>/dev/null || exit 1
+    zmodload zsh/datetime 2>/dev/null || exit 1
+    zmodload zsh/stat 2>/dev/null || exit 1
+    exit 0
+  ' >/dev/null 2>&1
+}
+
+find_working_zsh() {
+  # shellcheck disable=SC2086 # intentional word-splitting of ZSH_CANDIDATES
+  for c in $ZSH_CANDIDATES; do
+    [ -x "$c" ] || continue
+    if zsh_usable "$c"; then ZSH_BIN="$c"; return 0; fi
+  done
+  _p="$(command -v zsh 2>/dev/null || true)"
+  if [ -n "$_p" ] && [ -x "$_p" ] && zsh_usable "$_p"; then
+    ZSH_BIN="$_p"; return 0
   fi
-  log "Installing zsh"
+  return 1
+}
+
+if find_working_zsh; then
+  ok "zsh: $ZSH_BIN (core modules load)"
+else
+  warn "zsh is missing or broken: core modules (zsh/zle, zsh/parameter, ...) do not load."
+  warn "This is usually a source-built zsh in ~/.local/bin shadowing the system one."
+  if [ "$NO_ZSH_INSTALL" = "1" ]; then
+    die "no working zsh found (NO_ZSH_INSTALL=1 set). Install one, e.g.: sudo apt-get install -y zsh"
+  fi
+  log "Installing system zsh (this also installs the missing core module .so files)"
   if [ "$OS" = "Darwin" ]; then
     have brew && brew install zsh || die "zsh missing and Homebrew not found; install zsh manually"
   else
     install_pkg zsh || die "could not install zsh; install it manually and re-run"
   fi
+  find_working_zsh || die "zsh still not functional after install. Fix manually, e.g.: sudo apt-get install -y zsh"
+  ok "zsh: $ZSH_BIN (core modules load)"
 fi
-ZSH_BIN="$(command -v zsh)"
-ok "zsh: $ZSH_BIN"
 
 # --------------------------------------------------------------------------- #
 # 2. Oh My Zsh + theme + plugins
@@ -204,6 +250,14 @@ cat > "$HOME/.zshrc" <<'ZSHRC'
 if [[ -r "${XDG_CACHE_HOME:-$HOME/.cache}/p10k-instant-prompt-${(%):-%n}.zsh" ]]; then
   source "${XDG_CACHE_HOME:-$HOME/.cache}/p10k-instant-prompt-${(%):-%n}.zsh"
 fi
+
+# Source-built zsh keeps core modules in per-version dirs; add every user-local
+# module dir we can find so a hand-compiled zsh under ~/.local works alongside
+# the distro one. No-op on normal installs.
+for _moddir in ${HOME}/.local/lib/*/zsh/*(N) ${HOME}/.local/lib/zsh/*(N); do
+  [ -d "$_moddir/zsh" ] && module_path=("$_moddir" $module_path)
+done
+unset _moddir
 
 export ZSH="$HOME/.oh-my-zsh"
 ZSH_THEME="powerlevel10k/powerlevel10k"
@@ -287,6 +341,9 @@ ok ".zshrc written"
 
 # What shell does the system actually have on record for this user?
 recorded_shell() {
+  # TEST_RECORDED_SHELL lets the test suite simulate any login-shell state
+  # deterministically, independent of the host account.
+  if [ -n "${TEST_RECORDED_SHELL:-}" ]; then printf '%s\n' "$TEST_RECORDED_SHELL"; return 0; fi
   if have getent; then getent passwd "$(id -un)" 2>/dev/null | cut -d: -f7
   elif [ "$OS" = "Darwin" ] && have dscl; then
     dscl . -read "/Users/$(id -un)" UserShell 2>/dev/null | awk '{print $2}'
